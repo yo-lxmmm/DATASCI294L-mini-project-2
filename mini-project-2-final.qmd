@@ -1,0 +1,1033 @@
+---
+title: "mini-proj-2-new"
+format: html
+editor: visual
+author: Xinman (Yoyo) Liu
+---
+
+# Part 1
+
+```{r}
+# Load required libraries
+library(tidyverse)
+library(ggplot2)
+library(viridis)
+library(scales)
+library(corrplot)
+library(caret)
+library(gridExtra)
+
+set.seed(42)
+```
+
+```{r}
+# load training and test data
+train_eoc_df <- read_csv("filtered80_eoc_2023.csv")
+train_responses_df <- read_csv("filtered80_responses_2023.csv")
+
+# for Kaggle competition
+test_eoc_df <- read_csv("filtered20_eoc_2023.csv")
+test_responses_df <- read_csv("filtered20_responses_2023.csv")
+
+glimpse(train_eoc_df)
+glimpse(train_responses_df)
+```
+
+```{r}
+# set theme for visualizations
+theme_set(
+  theme_minimal(base_size = 13) +
+    theme(
+      text = element_text(family = "Times New Roman"),
+      plot.title = element_text(family = "Times New Roman", face = "bold"),
+      axis.title = element_text(family = "Times New Roman"),
+      legend.title = element_text(family = "Times New Roman"),
+      legend.text = element_text(family = "Times New Roman"),
+      plot.caption = element_text(family = "Times New Roman")
+    )
+)
+```
+
+## Data Wrangling
+
+```{r}
+# pivot long the EOC data
+train_eoc_long <- train_eoc_df %>%
+  pivot_longer(
+    cols = c(`1`, `2`, `3`, `4`, `5`, `6`, `7`, `8`, `9`),
+    names_to = "chapter",
+    values_to = "score"
+  ) %>%
+  mutate(chapter = as.numeric(chapter)) %>%
+  filter(!is.na(score)) 
+
+
+test_eoc_long <- test_eoc_df %>%
+  mutate(chapter = as.numeric(chapter))
+
+head(train_eoc_long)
+head(test_eoc_long)
+```
+
+### Engagement Metrics
+
+```{r}
+# fuction to calculate session-based duration, accounting for gaps exceeding 60 min
+calculate_session_duration <- function(timestamps, timeout_ms = 60*60*1000) {
+  if (length(timestamps) <= 1 || all(is.na(timestamps))) {
+    return(NA)
+  }
+  
+  timestamps <- sort(timestamps[!is.na(timestamps)])
+  
+  # calculate time differences between consecutive interactions
+  time_diffs <- diff(timestamps)
+  
+  # identify session breaks (those that are longer than the 60 min timeout)
+  session_breaks <- which(time_diffs > timeout_ms)
+  
+  if (length(session_breaks) == 0) {
+    return(max(timestamps) - min(timestamps))
+  } else {
+    session_starts <- c(timestamps[1], timestamps[session_breaks + 1])
+    session_ends <- c(timestamps[session_breaks], timestamps[length(timestamps)])
+    return(sum(session_ends - session_starts))
+  }
+}
+
+# function to calculate engagement metrics
+calculate_engagement_metrics <- function(responses_df) {
+  responses_df %>%
+    # extract chapter number as numeric (using numeric here instead of as.factor here to model chapter progression)
+    mutate(chapter_num = as.numeric(chapter_num)) %>%
+    group_by(student_id, chapter_num) %>%
+    summarize(
+      interaction_count = n(),
+      unique_pages_visited = n_distinct(page_num),
+      avg_points_earned = mean(points_earned, na.rm = TRUE),
+      completion_rate = mean(completes_page, na.rm = TRUE),
+      session_duration = calculate_session_duration(dt_submitted_processed_ms),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      session_duration_hours = session_duration / (1000 * 60 * 60)
+    )
+}
+
+# calculate engagement metrics for both datasets
+train_engagement <- calculate_engagement_metrics(train_responses_df)
+test_engagement <- calculate_engagement_metrics(test_responses_df)
+```
+
+```{r}
+# function to join engagement metrics with EOC scores
+combine_data <- function(eoc_long, engagement_metrics) {
+  eoc_long %>%
+    left_join(engagement_metrics, 
+              by = c("student_id" = "student_id", "chapter" = "chapter_num"))
+}
+
+# apply to both datasets
+train_data <- combine_data(train_eoc_long, train_engagement)
+test_data <- combine_data(test_eoc_long, test_engagement)
+
+glimpse(train_data)
+```
+
+### Within Student Centering and Scaling
+
+```{r}
+# function to calculate student-level means and center variables
+center_and_scale_data <- function(data) {
+  student_means <- data %>%
+    group_by(student_id) %>%
+    summarize(
+      mean_score = mean(score, na.rm = TRUE),
+      mean_interaction_count = mean(interaction_count, na.rm = TRUE),
+      mean_unique_pages = mean(unique_pages_visited, na.rm = TRUE),
+      mean_points_earned = mean(avg_points_earned, na.rm = TRUE),
+      mean_completion_rate = mean(completion_rate, na.rm = TRUE),
+      mean_session_duration = mean(session_duration, na.rm = TRUE),
+      mean_session_duration_hours = mean(session_duration_hours, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  # join with original data
+  data %>%
+    left_join(student_means, by = "student_id") %>%
+    mutate(
+      # within-student centered variables
+      score_centered = score - mean_score,
+      interaction_count_centered = interaction_count - mean_interaction_count,
+      unique_pages_centered = unique_pages_visited - mean_unique_pages,
+      points_earned_centered = avg_points_earned - mean_points_earned,
+      completion_rate_centered = completion_rate - mean_completion_rate,
+      session_duration_centered = session_duration - mean_session_duration,
+      session_duration_hours_centered = session_duration_hours - mean_session_duration_hours,
+      
+      # scale centered variables (standardization)
+      interaction_count_centered_scaled = scale(interaction_count_centered)[,1],
+      unique_pages_centered_scaled = scale(unique_pages_centered)[,1],
+      points_earned_centered_scaled = scale(points_earned_centered)[,1],
+      completion_rate_centered_scaled = scale(completion_rate_centered)[,1],
+      session_duration_centered_scaled = scale(session_duration_centered)[,1],
+      
+      # scale the raw variables for models that use them
+      interaction_count_scaled = scale(interaction_count)[,1],
+      unique_pages_visited_scaled = scale(unique_pages_visited)[,1],
+      avg_points_earned_scaled = scale(avg_points_earned)[,1],
+      completion_rate_scaled = scale(completion_rate)[,1],
+      session_duration_scaled = scale(session_duration)[,1]
+    )
+}
+
+# apply to bboth datasets
+train_data_processed <- center_and_scale_data(train_data)
+test_data_processed <- center_and_scale_data(test_data)
+
+summary(train_data_processed %>% select(contains("centered")))
+```
+
+### Descriptive Data Viz
+
+```{r}
+# 1. distribution of quiz scores
+p1 <- train_data_processed %>%
+  ggplot(aes(x = score)) +
+  geom_histogram(binwidth = 0.05, fill = "steelblue", color = "white", alpha = 0.7) +
+  geom_vline(aes(xintercept = mean(score, na.rm = TRUE)), 
+             color = "darkred", linetype = "dashed", size = 1) +
+  labs(title = "Distribution of Quiz Scores",
+       x = "Quiz Score",
+       y = "Count") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+print(p1)
+```
+
+```{r}
+
+# 2. distribution of key engagement metrics
+
+engagement_vars <- train_data_processed %>%
+  select(interaction_count_scaled, 
+         unique_pages_visited_scaled,
+         avg_points_earned_scaled, 
+         completion_rate_scaled,
+         session_duration_scaled) %>%
+  pivot_longer(cols = everything(), 
+               names_to = "metric", 
+               values_to = "value")
+
+engagement_vars <- engagement_vars %>%
+  mutate(metric = case_when(
+    metric == "interaction_count_scaled" ~ "Interaction Count",
+    metric == "unique_pages_visited_scaled" ~ "Unique Pages Visited",
+    metric == "avg_points_earned_scaled" ~ "Practice Points Earned",
+    metric == "completion_rate_scaled" ~ "Completion Rate",
+    metric == "session_duration_scaled" ~ "Session Duration",
+    TRUE ~ metric
+  ))
+
+# density plots for each engagement metric
+p2 <- engagement_vars %>%
+  ggplot(aes(x = value, fill = metric)) +
+  geom_density(alpha = 0.7) +
+  facet_wrap(~ metric, scales = "free") +
+  labs(title = "Distribution of Engagement Metrics (Standardized)",
+       x = "Standardized Value",
+       y = "Density") +
+  theme_minimal() +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust = 0.5, face = "bold"))
+
+print(p2)
+```
+
+```{r}
+# 3. engagement metrics by chapter boxplot
+chapter_engagement <- train_data_processed %>%
+  select(chapter, interaction_count, unique_pages_visited, 
+         avg_points_earned, completion_rate, session_duration_hours) %>%
+  pivot_longer(cols = -chapter, names_to = "metric", values_to = "value") %>%
+  mutate(metric = case_when(
+    metric == "interaction_count" ~ "Interaction Count",
+    metric == "unique_pages_visited" ~ "Unique Pages Visited",
+    metric == "avg_points_earned" ~ "Practice Points Earned",
+    metric == "completion_rate" ~ "Completion Rate",
+    metric == "session_duration_hours" ~ "Session Duration (hours)",
+    TRUE ~ metric
+  ))
+
+p3 <- chapter_engagement %>%
+  ggplot(aes(x = factor(chapter), y = value)) +
+  geom_boxplot(fill = "lightblue", alpha = 0.7) +
+  facet_wrap(~ metric, scales = "free_y") +
+  labs(title = "Engagement Metrics by Chapter",
+       x = "Chapter",
+       y = "Value") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+print(p3)
+```
+
+```{r}
+# 4. practice performance vs quiz scores
+p4 <- train_data_processed %>%
+  ggplot(aes(x = avg_points_earned, y = score)) +
+  geom_point(alpha = 0.3, color = "grey") +
+  geom_smooth(method = "lm", color = "darkred") +
+  labs(title = "Relationship Between Practice Performance and Quiz Scores",
+       x = "Average Points Earned on Practice",
+       y = "Quiz Score") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+print(p4)
+```
+
+```{r}
+# sample of students' individual learning trajectories
+set.seed(123)
+sample_students <- sample(unique(train_data_processed$student_id), 20)
+
+train_data_processed %>%
+  filter(student_id %in% sample_students) %>%
+  ggplot(aes(x = chapter, y = score, group = student_id, color = student_id)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    title = "Performance Trajectories Across Chapters",
+    x = "Chapter",
+    y = "Score"
+  ) +
+  theme(legend.position = "none") 
+```
+
+### Correlation Analysis
+
+```{r}
+# correlation analysis
+key_centered_vars <- train_data_processed %>%
+  select(score_centered, 
+         interaction_count_centered, 
+         unique_pages_centered,
+         points_earned_centered, 
+         completion_rate_centered,
+         session_duration_centered)
+
+cor_matrix <- cor(key_centered_vars, use = "pairwise.complete.obs")
+
+corrplot(cor_matrix, 
+         method = "circle", 
+         type = "upper",
+         tl.col = "black", 
+         tl.srt = 45,
+         diag = FALSE,
+         addCoef.col = "black",
+         number.cex = 0.7,
+         title = "Correlations Between Centered Engagement Metrics and Performance",
+         mar = c(0, 0, 2, 0))
+```
+
+### Prep Final Data
+
+```{r}
+# function to prepare final dataset for modeling
+prepare_model_data <- function(data, is_test = FALSE) {
+  if (is_test) {
+    # filter only on predictor variables for test data
+    data %>%
+      filter_at(vars(interaction_count_centered, 
+                     unique_pages_centered,
+                     points_earned_centered, 
+                     completion_rate_centered,
+                     session_duration_centered), 
+                all_vars(!is.na(.)))
+  } else {
+    # keep original filtering for training data
+    data %>%
+      filter(!is.na(score_centered)) %>%
+      filter_at(vars(ends_with("_centered")), all_vars(!is.na(.)))
+  }
+}
+
+# apply to both training and test
+train_model_data <- prepare_model_data(train_data_processed, is_test = FALSE)
+test_model_data <- prepare_model_data(test_data_processed, is_test = TRUE)
+
+cat("training data dimensions:", dim(train_model_data)[1], "rows,",
+    dim(train_model_data)[2], "columns\n")
+cat("test data dimensions:", dim(test_model_data)[1], "rows,",
+    dim(test_model_data)[2], "columns\n")
+
+write_csv(train_model_data, "train_model_data.csv")
+write_csv(test_model_data, "test_model_data.csv")
+```
+
+# Part 2
+
+## RQ1: Types of Behavioral Engagement
+
+```{r}
+
+library(lme4)
+
+# null model 1 (random intercept only)
+m1_1_null <- lmer(score ~ (1 | student_id), data = train_model_data, REML = FALSE)
+summary(m1_1_null)
+
+# calculate ICC
+library(performance)
+icc_h1 <- icc(m1_1_null)
+print(icc_h1)
+
+# model 1.2: added different types of engagement metrics 
+
+m1_2_engagement <- lmer(score ~ 
+  interaction_count_centered_scaled + 
+  unique_pages_centered_scaled +
+  points_earned_centered_scaled + 
+  completion_rate_centered_scaled + 
+  session_duration_centered_scaled +
+  (1 | student_id),
+  data = train_model_data, REML = FALSE)
+
+summary(m1_2_engagement)
+
+# compare to null model
+anova(m1_1_null, m1_2_engagement)
+
+# var explained
+var_m1_1 <- as.data.frame(VarCorr(m1_1_null))
+var_m1_2 <- as.data.frame(VarCorr(m1_2_engagement))
+
+r2_level1 <- (var_m1_1$vcov[2] - var_m1_2$vcov[2])/var_m1_1$vcov[2]
+r2_level2 <- (var_m1_1$vcov[1] - var_m1_2$vcov[1])/var_m1_1$vcov[1]
+
+cat("level 1 (within-student) variance explained:", round(r2_level1*100, 2), "%\n")
+cat("level 2 (between-student) variance explained:", round(r2_level2*100, 2), "%\n")
+```
+
+## RQ2: Within-Student Changes
+
+```{r}
+# model 2
+m2_within <- lm(score_centered ~ 
+  interaction_count_centered_scaled +
+  unique_pages_centered_scaled +
+  points_earned_centered_scaled +
+  completion_rate_centered_scaled +
+  session_duration_centered_scaled,
+  data = train_model_data)
+
+summary(m2_within)
+
+```
+
+## RQ3: Chapter-Level Effects
+
+```{r}
+# model 3.1 with chapter as fixed effect
+m3_1_chapter <- lmer(score ~ 
+  interaction_count_centered_scaled +
+  unique_pages_centered_scaled +
+  points_earned_centered_scaled +
+  completion_rate_centered_scaled +
+  session_duration_centered_scaled +
+  chapter +
+  (1 | student_id),
+  data = train_model_data, REML = FALSE)
+
+summary(m3_1_chapter)
+
+# compare to model without chapter
+anova(m1_2_engagement, m3_1_chapter)
+
+
+# model 3.2 with cross-level interactions (focusing on practice points earned as the key predictor as shown from results above)
+m3_2_interaction <- lmer(score ~ 
+  interaction_count_centered_scaled +
+  unique_pages_centered_scaled +
+  points_earned_centered_scaled +
+  completion_rate_centered_scaled +
+  session_duration_centered_scaled +
+  chapter +
+  points_earned_centered_scaled:chapter +
+  (1 | student_id),
+  data = train_model_data, REML = FALSE)
+
+summary(m3_2_interaction)
+
+# compare to model without interactions
+anova(m3_1_chapter, m3_2_interaction)
+```
+
+```{r}
+# visualize cross-level interaction for points earned
+interaction_data <- expand.grid(
+  chapter = c(1, 3, 5, 7, 9),
+  points_earned_centered_scaled = seq(-2, 2, by = 0.5),
+  interaction_count_centered_scaled = 0,
+  unique_pages_centered_scaled = 0,
+  completion_rate_centered_scaled = 0,
+  session_duration_centered_scaled = 0
+)
+
+# add a student_id for prediction
+most_common_student <- names(which.max(table(train_model_data$student_id)))
+interaction_data$student_id <- most_common_student
+
+# generate predictions
+interaction_data$predicted_score <- predict(m3_2_interaction, 
+                                          newdata = interaction_data, 
+                                          allow.new.levels = TRUE)
+
+ggplot(interaction_data, aes(x = points_earned_centered_scaled, 
+                           y = predicted_score, 
+                           color = factor(chapter),
+                           group = chapter)) +
+  geom_line(size = 1) +
+  labs(
+    title = "Relationship Between Practice Performance and Quiz Scores Across Capters",
+    subtitle = "Cross-level interaction between points earned and chapter progression",
+    x = "Deviation from Average Practice Performance (standardized)",
+    y = "Predicted Quiz Score",
+    color = "Chapter"
+  ) +
+  theme() +
+  scale_color_viridis_d()
+```
+
+```{r}
+# within-student practice-quiz Relationship by chapter
+practice_quiz_relationship <- ggplot(train_model_data, 
+                                    aes(x = points_earned_centered, y = score_centered)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "lm", color = "blue") +
+  facet_wrap(~chapter) +
+  labs(
+    title = "Chapter-Specific Relationships Between Practice Performance and Quiz Scores",
+    x = "Deviation from Student's Average Practice Points Earned",
+    y = "Deviation from Student's Average Quiz Score"
+  ) +
+  theme_minimal() +
+  theme(
+    # Set Times New Roman for all text elements
+    text = element_text(family = "Times New Roman"),
+    plot.title = element_text(family = "Times New Roman", hjust = 0.5, size = 14, face = "bold"),
+    axis.title = element_text(family = "Times New Roman", size = 12),
+    axis.text = element_text(family = "Times New Roman", size = 10),
+    strip.text = element_text(family = "Times New Roman", size = 12, face = "bold"),
+    
+    # Reduce spacing between facets
+    panel.spacing = unit(0.5, "lines"),
+    
+    # Optional: Adjust strip background
+    strip.background = element_rect(fill = "lightgray", color = NA)
+  )
+
+print(practice_quiz_relationship)
+```
+
+## RQ4: Student-Specific Effects (Random Slopes)
+
+```{r}
+# model 4 with random slopes for points earned
+m4_random_slopes <- lmer(score ~ 
+  interaction_count_centered_scaled +
+  unique_pages_centered_scaled +
+  points_earned_centered_scaled +
+  completion_rate_centered_scaled +
+  session_duration_centered_scaled +
+  chapter +
+  # correlated random intercepts and slopes
+  (1 + points_earned_centered_scaled | student_id),
+  data = train_model_data, REML = FALSE,
+  control = lmerControl(optimizer = "bobyqa"))
+
+summary(m4_random_slopes)
+
+# compare to model without random slopes
+anova(m3_1_chapter, m4_random_slopes)
+```
+
+```{r}
+# visualize distribution of random slopes
+ranef_data <- ranef(m4_random_slopes)$student_id
+ranef_data$student_id <- rownames(ranef_data)
+
+ggplot(ranef_data, aes(x = points_earned_centered_scaled)) +
+  geom_histogram(bins = 30, fill = "grey50", alpha = 0.7) +
+  labs(
+    title = "Distribution of Student-Specific Slopes for Points Earned",
+    x = "Student-Specific Deviation from Average",
+    y = "count"
+  ) +
+  theme()
+```
+
+# Part 3
+
+## CV
+
+```{r}
+# k-fold cross-validation function for all model types
+k_fold_cv <- function(data, k = 5, model_formula, random_effects = TRUE, model_type = "mixed") {
+  set.seed(42)
+  
+  student_ids <- unique(data$student_id)
+  folds <- sample(cut(seq(1, length(student_ids)), breaks = k, labels = FALSE))
+  names(folds) <- student_ids
+  
+  cv_rmse <- numeric(k)
+  cv_r2 <- numeric(k)
+  
+  for (i in 1:k) {
+    test_students <- student_ids[folds == i]
+    
+    # split data fold
+    train_data_fold <- data[!data$student_id %in% test_students, ]
+    test_data_fold <- data[data$student_id %in% test_students, ]
+    
+    if (model_type == "mixed") {
+      if (random_effects) {
+        model <- lmer(model_formula, data = train_data_fold, REML = FALSE)
+        preds <- predict(model, newdata = test_data_fold, allow.new.levels = TRUE)
+      } else {
+        model <- lm(model_formula, data = train_data_fold)
+        preds <- predict(model, newdata = test_data_fold)
+      }
+    } else if (model_type == "null") {
+      model <- lmer(model_formula, data = train_data_fold, REML = FALSE)
+      preds <- rep(fixef(model)["(Intercept)"], nrow(test_data_fold))
+    }
+    
+    # compute metrics
+    if (deparse(model_formula[[2]]) == "score") {
+      actual <- test_data_fold$score
+    } else {
+      actual <- test_data_fold$score_centered
+    }
+    
+    cv_rmse[i] <- sqrt(mean((actual - preds)^2, na.rm = TRUE))
+    cv_r2[i] <- cor(actual, preds, use = "complete.obs")^2
+  }
+  
+  return(list(
+    mean_rmse = mean(cv_rmse),
+    sd_rmse = sd(cv_rmse),
+    mean_r2 = mean(cv_r2),
+    sd_r2 = sd(cv_r2),
+    fold_rmse = cv_rmse,
+    fold_r2 = cv_r2
+  ))
+}
+
+# run 5-fold cv on all models
+
+# model m1_1_null (null model)
+cv_m1_1 <- k_fold_cv(
+  data = train_model_data, 
+  k = 5,
+  model_formula = score ~ (1 | student_id),
+  random_effects = TRUE,
+  model_type = "null"
+)
+
+# model m1_2_engagement (engagement types)
+cv_m1_2 <- k_fold_cv(
+  data = train_model_data, 
+  k = 5,
+  model_formula = score ~ 
+    interaction_count_centered_scaled + 
+    unique_pages_centered_scaled + 
+    points_earned_centered_scaled + 
+    completion_rate_centered_scaled + 
+    session_duration_centered_scaled + 
+    (1 | student_id),
+  random_effects = TRUE
+)
+
+# model m2_within (within-student changes)
+cv_m2 <- k_fold_cv(
+  data = train_model_data, 
+  k = 5,
+  model_formula = score_centered ~ 
+    interaction_count_centered_scaled + 
+    unique_pages_centered_scaled + 
+    points_earned_centered_scaled + 
+    completion_rate_centered_scaled + 
+    session_duration_centered_scaled,
+  random_effects = FALSE
+)
+
+# model m3_1_chapter (chapter context)
+cv_m3_1 <- k_fold_cv(
+  data = train_model_data, 
+  k = 5,
+  model_formula = score ~ 
+    interaction_count_centered_scaled + 
+    unique_pages_centered_scaled + 
+    points_earned_centered_scaled + 
+    completion_rate_centered_scaled + 
+    session_duration_centered_scaled + 
+    factor(chapter) + (1 | student_id),
+  random_effects = TRUE
+)
+
+# model m3_2_interaction (cross-level interaction)
+cv_m3_2 <- k_fold_cv(
+  data = train_model_data, 
+  k = 5,
+  model_formula = score ~ 
+    interaction_count_centered_scaled + 
+    unique_pages_centered_scaled + 
+    points_earned_centered_scaled + 
+    completion_rate_centered_scaled + 
+    session_duration_centered_scaled + 
+    chapter + 
+    points_earned_centered_scaled:chapter + 
+    session_duration_centered_scaled:chapter + 
+    (1 | student_id),
+  random_effects = TRUE
+)
+
+# model m4_random_slopes (student-specific slopes)
+cv_M4 <- k_fold_cv(
+  data = train_model_data, 
+  k = 5,
+  model_formula = score ~ 
+    interaction_count_centered_scaled + 
+    unique_pages_centered_scaled + 
+    points_earned_centered_scaled + 
+    completion_rate_centered_scaled + 
+    session_duration_centered_scaled + 
+    chapter + (1 + points_earned_centered_scaled | student_id),
+  random_effects = TRUE
+)
+
+# df for cv results
+cv_results_all <- data.frame(
+  Model = c("Null Model (M1.1)",
+            "Engagement Types (M1.2)",
+            "Within-Student Changes (M2)", 
+            "Chapter Variation (M3.1)",
+            "Cross-Level Interaction (M3.2)",
+            "Student-Specific Effects (M4)"),
+  CV_RMSE_Mean = c(cv_m1_1$mean_rmse,
+                   cv_m1_2$mean_rmse,
+                   cv_m2$mean_rmse, 
+                   cv_m3_1$mean_rmse,
+                   cv_m3_2$mean_rmse,
+                   cv_M4$mean_rmse),
+  CV_RMSE_SD = c(cv_m1_1$sd_rmse,
+                 cv_m1_2$sd_rmse,
+                 cv_m2$sd_rmse, 
+                 cv_m3_1$sd_rmse,
+                 cv_m3_2$sd_rmse,
+                 cv_M4$sd_rmse),
+  CV_R2_Mean = c(cv_m1_1$mean_r2,
+                 cv_m1_2$mean_r2,
+                 cv_m2$mean_r2, 
+                 cv_m3_1$mean_r2,
+                 cv_m3_2$mean_r2,
+                 cv_M4$mean_r2),
+  CV_R2_SD = c(cv_m1_1$sd_r2,
+               cv_m1_2$sd_r2,
+               cv_m2$sd_r2, 
+               cv_m3_1$sd_r2,
+               cv_m3_2$sd_r2,
+               cv_M4$sd_r2)
+)
+
+print(cv_results_all)
+```
+
+```{r}
+cv_results_all$Model <- factor(cv_results_all$Model, 
+                               levels = rev(c("Null Model (M1.1)",
+                                        "Engagement Types (M1.2)",
+                                        "Within-Student Changes (M2)", 
+                                        "Chapter Variation (M3.1)",
+                                        "Cross-Level Interaction (M3.2)",
+                                        "Student-Specific Effects (M4)")))
+
+cv_viz <- ggplot(cv_results_all, aes(x = Model, y = CV_RMSE_Mean)) +
+  geom_bar(stat = "identity", fill = "grey50") +
+  geom_errorbar(aes(ymin = CV_RMSE_Mean - CV_RMSE_SD, 
+                    ymax = CV_RMSE_Mean + CV_RMSE_SD), 
+                width = 0.2) +
+  labs(
+    title = "Cross-Validation Results: RMSE by Model",
+    x = "",
+    y = "Mean RMSE (with standard deviation)"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  coord_flip()
+
+print(cv_viz)
+```
+
+## Model Comparison and Selection
+
+```{r}
+# AIC/BIC metrics for extra comparison
+model_comparison_all <- data.frame(
+  Model = c("Null Model (M1.1)",
+            "Engagement Types (M1.2)",
+            "Within-Student Changes (M2)",
+            "Chapter Variation (M3.1)",
+            "Cross-Level Interaction (M3.2)",
+            "Student-Specific Effects (M4)"),
+  AIC = c(AIC(m1_1_null),
+          AIC(m1_2_engagement),
+          AIC(m2_within),
+          AIC(m3_1_chapter),
+          AIC(m3_2_interaction),
+          AIC(m4_random_slopes)),
+  BIC = c(BIC(m1_1_null),
+          BIC(m1_2_engagement),
+          BIC(m2_within),
+          BIC(m3_1_chapter),
+          BIC(m3_2_interaction),
+          BIC(m4_random_slopes))
+)
+
+model_comparison_all <- model_comparison_all %>%
+  left_join(cv_results_all, by = "Model")
+
+print(model_comparison_all)
+
+# select best model by CV RMSE metric
+best_model_idx <- which.min(model_comparison_all$CV_RMSE_Mean)
+
+best_cv_model <- model_comparison_all$Model[!is.na(model_comparison_all$Model[best_model_idx])]
+```
+
+```{r}
+# use best model to build predictions on test data
+
+test_pred <- predict(m2_within, newdata = test_model_data)
+
+train_mean_score <- mean(train_model_data$score, na.rm = TRUE)
+test_pred <- test_pred + train_mean_score
+
+test_pred <- pmax(0, pmin(1, test_pred))
+
+final_predictions <- data.frame(
+  student_id = test_model_data$student_id,
+  chapter = test_model_data$chapter,
+  predicted_score = test_pred
+)
+
+write_csv(final_predictions, "final_predictions.csv")
+cat("Final predictions saved to 'final_predictions.csv'\n")
+```
+
+## Visualize Coefficients of the Best Model
+
+```{r}
+# extract coefficients from h2_1_within model
+summary_model <- summary(m2_within)
+coef_table <- summary_model$coefficients
+
+coef_names <- names(coef(m2_within))
+main_effects <- coef_names[!grepl(":", coef_names) & !grepl("chapter", coef_names)]
+main_effects <- main_effects[main_effects != "(Intercept)"]
+
+# create df for plotting
+final_coefs <- data.frame(
+  variable = main_effects,
+  estimate = coef_table[main_effects, "Estimate"],
+  se = coef_table[main_effects, "Std. Error"]
+)
+
+final_coefs$readable_name <- case_when(
+  final_coefs$variable == "interaction_count_centered_scaled" ~ "Interaction Count",
+  final_coefs$variable == "unique_pages_centered_scaled" ~ "Unique Pages Visited",
+  final_coefs$variable == "points_earned_centered_scaled" ~ "Practice Points Earned",
+  final_coefs$variable == "completion_rate_centered_scaled" ~ "Completion Rate",
+  final_coefs$variable == "session_duration_centered_scaled" ~ "Session Duration",
+  TRUE ~ final_coefs$variable
+)
+
+ggplot(final_coefs, aes(x = reorder(readable_name, estimate), y = estimate)) +
+  geom_bar(stat = "identity", fill = "grey50") +
+  geom_errorbar(aes(ymin = estimate - 1.96*se, ymax = estimate + 1.96*se), width = 0.2) +
+  coord_flip() +
+  labs(
+    title = "Associations Between Engagement Metrics and Quiz Performance",
+    subtitle = "from within-student model (m2)",
+    x = "",
+    y = "Standardized Coefficient"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+## Diagnostic Plots
+
+```{r}
+# check model assumptions with diagnostic plots
+# qq plot of residuals
+qqnorm(resid(m2_within), main = "Normal Q-Q Plot of Residuals")
+qqline(resid(m2_within))
+
+# residuals vs. fitted values
+plot(fitted(m2_within), resid(m2_within), 
+     xlab = "Fitted Values", ylab = "Residuals",
+     main = "Residuals vs. Fitted Values")
+abline(h = 0, lty = 2)
+```
+
+## Model Comparison Table
+
+```{r}
+library(modelsummary)
+library(tibble)
+library(dplyr)
+
+coef_rename <- c(
+  "(Intercept)" = "(Intercept)",
+  "interaction_count_centered_scaled" = "Interaction Count",
+  "unique_pages_centered_scaled" = "Unique Pages",
+  "points_earned_centered_scaled" = "Practice Points",
+  "completion_rate_centered_scaled" = "Completion Rate",
+  "session_duration_centered_scaled" = "Session Duration",
+  "chapter" = "Chapter",
+  "points_earned_centered_scaled:chapter" = "Practice Points × Chapter",
+  "session_duration_centered_scaled:chapter" = "Session Duration × Chapter"
+)
+
+# df with CV RMSE
+cv_stats <- tibble(
+  statistic = "CV RMSE",
+  "M1.1" = sprintf("%.3f", cv_m1_1$mean_rmse),
+  "M1.2" = sprintf("%.3f", cv_m1_2$mean_rmse),
+  "M2" = sprintf("%.3f", cv_m2$mean_rmse),
+  "M3.1" = sprintf("%.3f", cv_m3_1$mean_rmse),
+  "M3.2" = sprintf("%.3f", cv_m3_2$mean_rmse),
+  "M4" = sprintf("%.3f", cv_M4$mean_rmse)
+)
+
+# random effects results
+sd_intercept <- tibble(
+  statistic = "SD (Student Intercept)",
+  "M1.1" = "0.131",
+  "M1.2" = "0.135",
+  "M2" = "",
+  "M3.1" = "0.137",
+  "M3.2" = "0.135",
+  "M4" = "0.137"
+)
+
+sd_points_earned <- tibble(
+  statistic = "SD (Practice Points Slope)",
+  "M1.1" = "",
+  "M1.2" = "",
+  "M2" = "",
+  "M3.1" = "",
+  "M3.2" = "",
+  "M4" = "0.025"
+)
+
+cor_params <- tibble(
+  statistic = "Cor (Intercept~Practice Points)",
+  "M1.1" = "",
+  "M1.2" = "",
+  "M2" = "",
+  "M3.1" = "",
+  "M3.2" = "",
+  "M4" = "-0.858"
+)
+
+sd_observations <- tibble(
+  statistic = "SD (Observations)",
+  "M1.1" = "0.153",
+  "M1.2" = "0.127",
+  "M2" = "",
+  "M3.1" = "0.121",
+  "M3.2" = "0.121",
+  "M4" = "0.118"
+)
+
+# regular model comparison
+models <- list(
+  "M1.1" = m1_1_null, 
+  "M1.2" = m1_2_engagement, 
+  "M2" = m2_within, 
+  "M3.1" = m3_1_chapter, 
+  "M3.2" = m3_2_interaction, 
+  "M4" = m4_random_slopes
+)
+
+# standard gof stats
+gof_display <- c("aic", "nobs")
+
+# combine
+all_rows <- bind_rows(
+  sd_intercept,
+  sd_points_earned,
+  cor_params,
+  sd_observations,
+  cv_stats
+)
+
+modelsummary(models,
+             output = "model_comparison_table.png",
+             title = "Multilevel Models Predicting Quiz Scores",
+             coef_map = coef_rename,
+             gof_map = gof_display,
+             add_rows = all_rows,
+             stars = TRUE,
+             fmt = 3)
+```
+
+```{r}
+library(texreg) # for different file formats
+
+screenreg(list(m1_1_null, m1_2_engagement, m2_within, m3_1_chapter, 
+                m3_2_interaction, m4_random_slopes),
+          custom.model.names = c("M1.1", "M1.2", "M2", "M3.1", "M3.2", "M4"),
+          custom.coef.names = c("(Intercept)", 
+                              "Interaction Count",
+                              "Unique Pages", 
+                              "Points Earned on Practice",
+                              "Completion Rate", 
+                              "Session Duration",
+                              "Chapter",
+                              "Points Earned on Practice × Chapter"),
+          include.variance = TRUE,
+          include.correlation = TRUE, 
+          digits = 3,
+          stars = c(0.001, 0.01, 0.05, 0.1),
+          custom.note = "+ p < 0.1, * p < 0.05, ** p < 0.01, *** p < 0.001")
+```
+
+```{r}
+wordreg(list(m1_1_null, m1_2_engagement, m2_within, m3_1_chapter, 
+           m3_2_interaction, m4_random_slopes),
+       file = "model_comparison_table.doc",
+       custom.model.names = c("Null", "Engagement", "Within", "Chapter", 
+                             "Interactions", "Random"),
+       digits = 3,
+       caption = "Multilevel Models Predicting Quiz Scores")
+```
+
+```{r regression-table, results='asis'}
+htmlreg(list(m1_1_null, m1_2_engagement, m2_within, m3_1_chapter, 
+            m3_2_interaction, m4_random_slopes),
+       custom.model.names = c("Null", "Engagement", "Within", "Chapter", 
+                             "Interactions", "Random"),
+       digits = 3,
+       caption = "Multilevel Models Predicting Quiz Performance",
+       custom.note = "* p<0.05, ** p<0.01, *** p<0.001",
+       star.symbol = "*",
+       doctype = FALSE,
+       html.tag = FALSE,
+       head.tag = FALSE,
+       body.tag = FALSE)
+```
